@@ -8,7 +8,9 @@ Data source: EU Publications Office — CELLAR
 Output: cn_codes_<year>.csv
 """
 
+import argparse
 import csv
+import json
 import re
 import sys
 import time
@@ -23,66 +25,15 @@ REQUEST_TIMEOUT = 180  # seconds per request
 # ---------------------------------------------------------------------------
 # EUDR commodity mapping — Regulation (EU) 2023/1115, Annex I
 # Maps CN code prefixes (spaces removed) to the EUDR commodity name.
-# Prefixes marked "ex" in the regulation (partial headings) are included
-# because the heading-level match is the best available without sub-code
-# product-level detail.
+# The mapping is stored in a separate JSON file so it can be reviewed and
+# updated independently of the script logic.
 # ---------------------------------------------------------------------------
-EUDR_PREFIXES: dict[str, list[str]] = {
-    "Cattle": [
-        "010221", "010229",
-        "0201", "0202",
-        "020610", "020622", "020629",
-        "160250",
-        "4101", "4104", "4107",
-    ],
-    "Cocoa": [
-        "1801", "1802", "1803", "1804", "1805", "1806",
-    ],
-    "Coffee": [
-        "0901",
-    ],
-    "Oil palm": [
-        "120710",
-        "1511",
-        "151321", "151329",
-        "230660",
-        "290545",
-        "291570", "291590",
-        "3823", "3826",
-    ],
-    "Rubber": [
-        "4001",
-        "4005", "4006", "4007", "4008",
-        "4010", "4011", "4012", "4013",
-        "4015", "4016", "4017",
-    ],
-    "Soya": [
-        "1201",
-        "120810",
-        "1507",
-        "2304",
-    ],
-    "Wood": [
-        "4401", "4402", "4403", "4404", "4405", "4406", "4407", "4408",
-        "4409", "4410", "4411", "4412", "4413", "4414", "4415", "4416",
-        "4417", "4418", "4419", "4420", "4421",
-        # Pulp of wood
-        "4701", "4702", "4703", "4704", "4705", "4706", "4707",
-        # Paper and paperboard
-        "4801", "4802", "4803", "4804", "4805", "4806", "4807", "4808",
-        "4809", "4810", "4811", "4812", "4813", "4814", "4816", "4817",
-        "4818", "4819", "4820", "4821", "4822", "4823",
-        # Printed books, newspapers, pictures, etc.
-        "4901", "4902", "4904", "4905", "4906", "4907", "4908",
-        "4909", "4910", "4911",
-        # Wooden furniture / seats / prefab buildings
-        "9401", "9403", "9406",
-    ],
-}
+EUDR_MAPPING_PATH = Path(__file__).with_name("eudr_prefixes.json")
+with EUDR_MAPPING_PATH.open(encoding="utf-8") as fh:
+    _EUDR_MAPPING_DATA = json.load(fh)
 
-# Consolidated version of Regulation (EU) 2023/1115 that EUDR_PREFIXES was
-# last verified against.  Update this date after reviewing a newer version.
-EUDR_MAPPING_CONSOLIDATED_DATE = "20251226"  # corresponds to 2025-12-26
+EUDR_PREFIXES: dict[str, list[str]] = _EUDR_MAPPING_DATA.get("commodities", {})
+EUDR_MAPPING_CONSOLIDATED_DATE = _EUDR_MAPPING_DATA.get("consolidated_date", "")
 
 # Build a flat list of (prefix, commodity) sorted longest-prefix-first so that
 # more specific matches (e.g. 6-digit) take priority over shorter ones.
@@ -166,11 +117,61 @@ def _sparql_select(query: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# CLI helpers
+# ---------------------------------------------------------------------------
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse command-line options for selecting a CN scheme explicitly."""
+    parser = argparse.ArgumentParser(description="Extract CN codes from the EU CELLAR SPARQL endpoint")
+    parser.add_argument("--year", help="Pin the CN publication year to retrieve (for example: 2026)")
+    parser.add_argument("--scheme-uri", help="Pin an exact CN concept scheme URI instead of discovering the latest one")
+    parser.add_argument("--no-metadata", action="store_true", help="Skip writing the companion metadata JSON file")
+    return parser.parse_args(argv)
+
+
+def infer_year_from_scheme_uri(scheme_uri: str) -> str:
+    """Infer a year from a CN scheme URI if possible."""
+    match = re.search(r"cn(\d{4})", scheme_uri, flags=re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def build_export_metadata(year: str, scheme_uri: str, row_count: int, eudr_mapping_date: str | None = None) -> dict:
+    """Build a small metadata block describing the export."""
+    return {
+        "exported_at": date.today().isoformat(),
+        "source": SPARQL_ENDPOINT,
+        "year": year,
+        "scheme_uri": scheme_uri,
+        "row_count": row_count,
+        "eudr_mapping_date": eudr_mapping_date or EUDR_MAPPING_CONSOLIDATED_DATE,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Step 1 — Discover the most recent CN concept scheme
 # ---------------------------------------------------------------------------
 
-def find_latest_cn_scheme() -> tuple[str, str]:
+def find_latest_cn_scheme(preferred_year: str | None = None) -> tuple[str, str]:
     """Return (scheme_uri, year) for the most recent CN publication."""
+    if preferred_year:
+        query = f"""
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+
+SELECT DISTINCT ?scheme WHERE {{
+    ?scheme a skos:ConceptScheme .
+    FILTER(REGEX(STR(?scheme), "cn{preferred_year}/cn{preferred_year}$", "i"))
+}}
+ORDER BY DESC(?scheme)
+LIMIT 10
+"""
+        rows = _sparql_select(query)
+        if rows:
+            best_uri = rows[0]["scheme"]
+            return best_uri, preferred_year
+        sys.exit(f"ERROR: Could not find any CN concept schemes for year {preferred_year} via SPARQL.")
+
     query = """
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
 
@@ -268,11 +269,22 @@ def fetch_all_cn_concepts(scheme_uri: str) -> list[dict]:
 # Step 3 — Build hierarchy and resolve chapter (commodity) names
 # ---------------------------------------------------------------------------
 
+def _sort_rows(rows: list[dict]) -> list[dict]:
+    """Return rows in a deterministic order keyed by notation and concept URI."""
+    return sorted(
+        rows,
+        key=lambda r: (
+            r.get("notation", "").replace(" ", ""),
+            r.get("concept", ""),
+        ),
+    )
+
+
 def build_lookup(rows: list[dict]) -> dict:
     """Build URI -> {notation, label, broader_uri} lookup.
     Merges data from duplicate rows (same concept from different queries)."""
     lookup: dict[str, dict] = {}
-    for r in rows:
+    for r in _sort_rows(rows):
         uri = r["concept"]
         if uri not in lookup:
             lookup[uri] = {
@@ -357,7 +369,7 @@ def resolve_section(uri: str, lookup: dict, _seen: set | None = None) -> str:
 # Step 4 — Assemble and write CSV
 # ---------------------------------------------------------------------------
 
-def write_csv(lookup: dict, year: str) -> Path:
+def write_csv(lookup: dict, year: str, scheme_uri: str, include_metadata: bool = True) -> tuple[Path, Path | None]:
     out_path = Path(__file__).with_name(f"cn_codes_{year}.csv")
 
     # Pre-build chapter_prefix -> chapter_label and section_label maps as fallback
@@ -402,21 +414,31 @@ def write_csv(lookup: dict, year: str) -> Path:
         eudr = classify_eudr(notation)
         records.append((notation, label, chapter, section, eudr))
 
-    records.sort(key=lambda r: r[0])
+    records.sort(key=lambda r: (r[0], r[1]))
 
     with open(out_path, "w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
         writer.writerow(["cn_code", "product_name", "commodity_name", "section_name", "eudr_commodity"])
         writer.writerows(records)
 
-    return out_path
+    metadata_path = None
+    if include_metadata:
+        metadata = build_export_metadata(year=year, scheme_uri=scheme_uri, row_count=len(records))
+        metadata_path = out_path.with_suffix(".meta.json")
+        with open(metadata_path, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2, ensure_ascii=False)
+            fh.write("\n")
+
+    return out_path, metadata_path
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-def main():
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
+
     print("=" * 60)
     print("EU Combined Nomenclature — CN Code Extractor")
     print(f"Date: {date.today()}")
@@ -426,9 +448,15 @@ def main():
     print("\n[1/5] Checking EUDR regulation for updates …")
     check_eudr_regulation_update()
 
-    print("\n[2/5] Discovering most recent CN concept scheme …")
-    scheme_uri, year = find_latest_cn_scheme()
-    print(f"  → Found CN {year}  ({scheme_uri})")
+    print("\n[2/5] Discovering CN concept scheme …")
+    if args.scheme_uri:
+        scheme_uri = args.scheme_uri
+        year = args.year or infer_year_from_scheme_uri(scheme_uri)
+        if not year:
+            sys.exit("ERROR: Could not infer a year from the provided --scheme-uri.")
+    else:
+        scheme_uri, year = find_latest_cn_scheme(args.year)
+    print(f"  → Selected CN {year}  ({scheme_uri})")
 
     print(f"\n[3/5] Fetching all CN {year} concepts chapter-by-chapter …")
     raw_rows = fetch_all_cn_concepts(scheme_uri)
@@ -439,8 +467,11 @@ def main():
     print(f"  → {len(lookup)} unique concepts")
 
     print("\n[5/5] Writing CSV …")
-    out = write_csv(lookup, year)
-    print(f"  → Saved to {out}  ({sum(1 for _ in open(out)) - 1} data rows)")
+    out, metadata_path = write_csv(lookup, year, scheme_uri, include_metadata=not args.no_metadata)
+    if metadata_path:
+        print(f"  → Saved CSV to {out} and metadata to {metadata_path}  ({sum(1 for _ in open(out)) - 1} data rows)")
+    else:
+        print(f"  → Saved to {out}  ({sum(1 for _ in open(out)) - 1} data rows)")
 
     print("\nDone ✓")
 
