@@ -26,7 +26,8 @@ REQUEST_TIMEOUT = 180  # seconds per request
 # EUDR commodity mapping — Regulation (EU) 2023/1115, Annex I
 # Maps CN code prefixes (spaces removed) to the EUDR commodity name.
 # The mapping is stored in a separate JSON file so it can be reviewed and
-# updated independently of the script logic.
+# updated independently of the script logic. This makes regulatory changes
+# easier to track and diff over time.
 # ---------------------------------------------------------------------------
 EUDR_MAPPING_PATH = Path(__file__).with_name("eudr_prefixes.json")
 with EUDR_MAPPING_PATH.open(encoding="utf-8") as fh:
@@ -121,7 +122,11 @@ def _sparql_select(query: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse command-line options for selecting a CN scheme explicitly."""
+    """Parse command-line options for selecting a CN scheme explicitly.
+
+    Using --year or --scheme-uri makes the export reproducible by pinning the
+    CN source version instead of always discovering the latest scheme.
+    """
     parser = argparse.ArgumentParser(description="Extract CN codes from the EU CELLAR SPARQL endpoint")
     parser.add_argument("--year", help="Pin the CN publication year to retrieve (for example: 2026)")
     parser.add_argument("--scheme-uri", help="Pin an exact CN concept scheme URI instead of discovering the latest one")
@@ -138,7 +143,11 @@ def infer_year_from_scheme_uri(scheme_uri: str) -> str:
 
 
 def build_export_metadata(year: str, scheme_uri: str, row_count: int, eudr_mapping_date: str | None = None) -> dict:
-    """Build a small metadata block describing the export."""
+    """Build a small metadata block describing the export.
+
+    The metadata file records the selected CN scheme, source endpoint, export
+    date and the EUDR mapping version so that later changes are easier to audit.
+    """
     return {
         "exported_at": date.today().isoformat(),
         "source": SPARQL_ENDPOINT,
@@ -154,7 +163,12 @@ def build_export_metadata(year: str, scheme_uri: str, row_count: int, eudr_mappi
 # ---------------------------------------------------------------------------
 
 def find_latest_cn_scheme(preferred_year: str | None = None) -> tuple[str, str]:
-    """Return (scheme_uri, year) for the most recent CN publication."""
+    """Return (scheme_uri, year) for the most recent CN publication.
+
+    When preferred_year is supplied, the function looks for the matching scheme
+    explicitly rather than always picking the latest publication returned by the
+    endpoint.
+    """
     if preferred_year:
         query = f"""
 PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
@@ -270,7 +284,11 @@ def fetch_all_cn_concepts(scheme_uri: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _sort_rows(rows: list[dict]) -> list[dict]:
-    """Return rows in a deterministic order keyed by notation and concept URI."""
+    """Return rows in a deterministic order keyed by notation and concept URI.
+
+    This keeps the build step stable even when the upstream SPARQL endpoint does
+    not return rows in the same order across runs.
+    """
     return sorted(
         rows,
         key=lambda r: (
@@ -370,6 +388,7 @@ def resolve_section(uri: str, lookup: dict, _seen: set | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 def write_csv(lookup: dict, year: str, scheme_uri: str, include_metadata: bool = True) -> tuple[Path, Path | None]:
+    """Write the CSV export and, optionally, a companion metadata JSON file."""
     out_path = Path(__file__).with_name(f"cn_codes_{year}.csv")
 
     # Pre-build chapter_prefix -> chapter_label and section_label maps as fallback

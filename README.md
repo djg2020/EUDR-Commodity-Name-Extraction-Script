@@ -7,13 +7,13 @@ A Python script that extracts the most current **EU Combined Nomenclature (CN) c
 | Data | Source | Type |
 |------|--------|------|
 | CN codes, product names, hierarchy | [EU Publications Office — CELLAR SPARQL endpoint](https://publications.europa.eu/webapi/rdf/sparql) | Live query (dynamic) |
-| EUDR commodity mapping | [Regulation (EU) 2023/1115, Annex I](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32023R1115) | Hardcoded from legal text |
+| EUDR commodity mapping | [Regulation (EU) 2023/1115, Annex I](https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32023R1115) | Reviewable JSON mapping derived from the legal text |
 
 The script auto-discovers the latest CN year (e.g. CN 2026) and fetches all codes chapter-by-chapter via SPARQL.
 
 ## Output
 
-A CSV file (`cn_codes_<year>.csv`) with the following columns:
+A CSV file (`cn_codes_<year>.csv`) with the following columns, plus an optional companion metadata file (`cn_codes_<year>.meta.json`) when metadata output is enabled:
 
 | Column | Description |
 |--------|-------------|
@@ -49,13 +49,21 @@ pip install requests
 python cn_code.py
 ```
 
+Optional flags:
+
+```bash
+python cn_code.py --year 2026
+python cn_code.py --scheme-uri http://data.europa.eu/xsp/cn2026/cn2026
+python cn_code.py --no-metadata
+```
+
 The script runs a 5-step pipeline:
 
-1. **Check EUDR regulation for updates** — queries EUR-Lex for newer consolidated versions of Regulation (EU) 2023/1115 and warns if the hardcoded Annex I mapping may be outdated
-2. **Discover latest CN scheme** — auto-detects the most recent CN year via SPARQL
+1. **Check EUDR regulation for updates** — queries EUR-Lex for newer consolidated versions of Regulation (EU) 2023/1115 and warns if the Annex I mapping may be outdated
+2. **Discover CN scheme** — either auto-detects the latest CN year or uses the explicit year/scheme URI you provide
 3. **Fetch CN codes** — retrieves all concepts chapter-by-chapter (97 chapters, ~60s)
 4. **Build hierarchy** — resolves chapter and section names via `skos:broader` chains
-5. **Write CSV** — outputs `cn_codes_<year>.csv` in the script directory
+5. **Write output** — outputs `cn_codes_<year>.csv` in the script directory and, by default, a companion `cn_codes_<year>.meta.json` file
 
 ## EUDR Commodity Classification
 
@@ -71,7 +79,7 @@ The script classifies each CN code against the seven commodities defined in the 
 
 ### Keeping the EUDR Mapping Current
 
-CN codes are fetched live from the EU SPARQL endpoint and are always up to date. The EUDR commodity mapping, however, is hardcoded from the regulation's legal text because no machine-readable EU data source exists for Annex I.
+CN codes are fetched live from the EU SPARQL endpoint and are always up to date. The EUDR commodity mapping, however, is stored in a reviewable JSON file so it can be updated independently of the script logic when the regulation or Annex I mapping changes.
 
 The script **automatically checks EUR-Lex** on each run for newer consolidated versions of the regulation. If an amendment is detected, it prints a warning:
 
@@ -85,8 +93,9 @@ The script **automatically checks EUR-Lex** on each run for newer consolidated v
 
 To update the mapping after reviewing a new Annex I:
 
-1. Update the `EUDR_PREFIXES` dictionary in `cn_code.py`
-2. Update `EUDR_MAPPING_CONSOLIDATED_DATE` to the new version date
+1. Edit the mapping file `eudr_prefixes.json`
+2. Update the `consolidated_date` entry to the new version date
+3. Re-run the script to regenerate the CSV and metadata
 
 ## License
 
