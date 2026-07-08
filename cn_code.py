@@ -21,6 +21,8 @@ import requests
 
 SPARQL_ENDPOINT = "https://publications.europa.eu/webapi/rdf/sparql"
 REQUEST_TIMEOUT = 180  # seconds per request
+MAX_RETRIES = 3
+BACKOFF_SECONDS = 2
 
 # ---------------------------------------------------------------------------
 # EUDR commodity mapping — Regulation (EU) 2023/1115, Annex I
@@ -100,15 +102,34 @@ def check_eudr_regulation_update() -> None:
 # SPARQL helpers
 # ---------------------------------------------------------------------------
 
+def _request_with_retries(method: str, url: str, **kwargs) -> requests.Response:
+    """Issue an HTTP request with a short retry loop for transient 5xx errors."""
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = getattr(requests, method)(url, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt == MAX_RETRIES:
+                raise
+            print(f"  ⚠ Request failed (attempt {attempt}/{MAX_RETRIES}): {exc}")
+            time.sleep(BACKOFF_SECONDS * attempt)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Request failed without an exception")
+
+
 def _sparql_select(query: str) -> list[dict]:
     """Run a SPARQL SELECT via POST and return rows as list of dicts."""
-    resp = requests.post(
+    resp = _request_with_retries(
+        "post",
         SPARQL_ENDPOINT,
         data={"query": query},
         timeout=REQUEST_TIMEOUT,
         headers={"Accept": "application/sparql-results+json"},
     )
-    resp.raise_for_status()
     data = resp.json()
     vars_ = data["head"]["vars"]
     rows = []
